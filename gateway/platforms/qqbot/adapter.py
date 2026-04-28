@@ -139,8 +139,11 @@ def _coerce_list(value: Any) -> List[str]:
 class QQAdapter(BasePlatformAdapter):
     """QQ Bot adapter backed by the official QQ Bot WebSocket Gateway + REST API."""
 
-    # QQ Bot API does not support editing sent messages.
-    SUPPORTS_MESSAGE_EDITING = False
+    # QQ Bot API supports progressive message updates via stream protocol (C2C only).
+    SUPPORTS_MESSAGE_EDITING = True
+    # QQ's stream protocol requires an explicit state=10 final chunk to close
+    # the message lifecycle and transition the UI out of the "typing" indicator.
+    REQUIRES_EDIT_FINALIZE = True
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     _TYPING_INPUT_SECONDS = 60  # input_notify duration reported to QQ
     _TYPING_DEBOUNCE_SECONDS = 50  # refresh before it expires
@@ -169,6 +172,7 @@ class QQAdapter(BasePlatformAdapter):
             extra.get("client_secret") or os.getenv("QQ_CLIENT_SECRET", "")
         ).strip()
         self._markdown_support = bool(extra.get("markdown_support", True))
+        self._stream_enabled = bool(extra.get("stream_enabled", True))
 
         # Auth/ACL policies
         self._dm_policy = str(extra.get("dm_policy", "open")).strip().lower()
@@ -207,6 +211,9 @@ class QQAdapter(BasePlatformAdapter):
 
         # Upload cache: content_hash -> {file_info, file_uuid, expires_at}
         self._upload_cache: Dict[str, Dict[str, Any]] = {}
+
+        # Stream state: chat_id → {"msg_id": str, "index": int}
+        self._stream_states: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -1870,6 +1877,97 @@ class QQAdapter(BasePlatformAdapter):
         logger.warning("[%s] Still not connected after %.0fs", self._log_tag, self._RECONNECT_WAIT_SECONDS)
         return False
 
+    async def edit_message(
+            self,
+            chat_id: str,
+            message_id: str,
+            content: str,
+            *,
+            finalize: bool = False,
+    ) -> SendResult:
+        chat_type = self._guess_chat_type(chat_id)
+        if chat_type != "c2c" or not self._stream_enabled:
+            logger.info("[QQ_DIAG] non_c2c_skip chat_type=%s stream_enabled=%s",
+                        chat_type, self._stream_enabled)
+            return SendResult(success=False, error="Streaming only supported for C2C")
+
+        stream = self._stream_states.get(chat_id)
+
+        if stream is None:
+            # First stream chunk: send full content as the initial message
+            # (QQ stream protocol: state=1 creates a new stream-backed message)
+            result = await self._send_stream_chunk(
+                chat_id, content, stream_state=1, msg_id=None, index=0,
+            )
+            if result.success and result.message_id:
+                self._stream_states[chat_id] = {
+                    "msg_id": result.message_id,
+                    "index": 1,
+                }
+                # Best-effort: delete the original non-stream message created
+                # by the stream consumer's initial send() call, leaving only
+                # the progressive stream message visible to the user.
+                if message_id and message_id != result.message_id:
+                    await self._try_delete_quietly(chat_id, message_id)
+            return result
+
+        # QQ stream protocol is replace-style: each POST replaces the message
+        # content entirely.  Send the full accumulated text every time so the
+        # user sees the complete message progressively growing, not truncated
+        # fragments.  (Verified via API test — same stream.id returns same
+        # message ID, confirming replace semantics.)
+        if not content and not finalize:
+            # Nothing to send and not finalizing — skip this edit
+            return SendResult(success=True, message_id=stream["msg_id"])
+
+        if len(content) > self.MAX_MESSAGE_LENGTH:
+            logger.info("[QQ_DIAG] overflow_detected chat_type=%s len=%d limit=%d stream_idx=%d",
+                        chat_type, len(content), self.MAX_MESSAGE_LENGTH, stream["index"])
+
+        state = 10 if finalize else 1
+        idx = stream["index"]
+        result = await self._send_stream_chunk(
+            chat_id, content, stream_state=state, msg_id=stream["msg_id"], index=idx,
+        )
+
+        if result.success:
+            # Track the returned message ID — QQ API may return a new ID even
+            # for updates, and subsequent chunks must reference the latest.
+            if result.message_id:
+                old_id = stream.get("msg_id")
+                new_id = result.message_id
+                if old_id and old_id != new_id:
+                    logger.info("[QQ_DIAG] id_rot old=%s new=%s same=false",
+                                old_id[:40] if old_id else "-",
+                                new_id[:40] if new_id else "-")
+                stream["msg_id"] = new_id
+            if finalize:
+                del self._stream_states[chat_id]
+            else:
+                stream["index"] = idx + 1
+
+        return result
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        chat_type = self._guess_chat_type(chat_id)
+        if chat_type != "c2c":
+            return False
+        try:
+            await self._api_request(
+                "DELETE", f"/v2/users/{chat_id}/messages/{message_id}",
+            )
+            return True
+        except Exception:
+            return False
+
+    async def _try_delete_quietly(self, chat_id: str, message_id: str) -> None:
+        try:
+            await self._api_request(
+                "DELETE", f"/v2/users/{chat_id}/messages/{message_id}",
+            )
+        except Exception:
+            pass
+
     async def send(
             self,
             chat_id: str,
@@ -1994,30 +2092,90 @@ class QQAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=msg_id, raw_response=data)
 
     def _build_text_body(
-            self, content: str, reply_to: Optional[str] = None
+            self, content: str, reply_to: Optional[str] = None,
+            stream: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build the message body for C2C/group text sending."""
         msg_seq = self._next_msg_seq(reply_to or "default")
 
         if self._markdown_support:
+            if len(content) > self.MAX_MESSAGE_LENGTH:
+                logger.warning(
+                    "[QQ_DIAG] truncation len=%d limit=%d type=%s",
+                    len(content), self.MAX_MESSAGE_LENGTH, "markdown",
+                )
             body: Dict[str, Any] = {
                 "markdown": {"content": content[: self.MAX_MESSAGE_LENGTH]},
                 "msg_type": MSG_TYPE_MARKDOWN,
-                "msg_seq": msg_seq,
             }
         else:
+            if len(content) > self.MAX_MESSAGE_LENGTH:
+                logger.warning(
+                    "[QQ_DIAG] truncation len=%d limit=%d type=%s",
+                    len(content), self.MAX_MESSAGE_LENGTH, "text",
+                )
             body = {
                 "content": content[: self.MAX_MESSAGE_LENGTH],
                 "msg_type": MSG_TYPE_TEXT,
-                "msg_seq": msg_seq,
             }
+
+        # msg_seq is only needed for non-stream messages (dedup key).
+        # C2C streaming payloads should omit it — QQ's undocumented stream
+        # protocol treats varying msg_seq values as separate messages rather
+        # than updates to the same stream.  Reference: AstrBot's
+        # qqofficial_message_event.py adds msg_seq only for non-C2C paths.
+        if stream is None:
+            body["msg_seq"] = msg_seq
 
         if reply_to:
             # For non-markdown mode, add message_reference
             if not self._markdown_support:
                 body["message_reference"] = {"message_id": reply_to}
 
+        if stream is not None:
+            stream_data = dict(stream)
+            if stream_data.get("id") is None:
+                stream_data.pop("id", None)
+            body["stream"] = stream_data
+
         return body
+
+    async def _send_stream_chunk(
+            self,
+            chat_id: str,
+            content: str,
+            stream_state: int,
+            msg_id: Optional[str] = None,
+            index: int = 0,
+    ) -> SendResult:
+        stream: Dict[str, Any] = {"state": stream_state, "index": index, "reset": False}
+        if msg_id is not None:
+            stream["id"] = msg_id
+
+        if stream_state == 10 and not content.endswith("\n"):
+            content = content + "\n"
+
+        body = self._build_text_body(content, stream=stream)
+        try:
+            logger.info(
+                "[%s] [QQ_DIAG] stream_send chat_id=%s state=%s id_sent=%s idx=%s len=%s preview=\"%s\"",
+                self._log_tag, chat_id,
+                stream.get("state"), stream.get("id", "-"), stream.get("index"),
+                len(content), content[:40].replace("\n", "\\n"),
+            )
+            data = await self._api_request("POST", f"/v2/users/{chat_id}/messages", body)
+            new_msg_id = str(data.get("id", ""))
+            same_id = "N/A" if stream.get("id") is None else ("true" if stream.get("id") == new_msg_id else "false")
+            logger.info(
+                "[%s] [QQ_DIAG] stream_resp id_recv=%s same_id=%s len=%s",
+                self._log_tag,
+                new_msg_id[:40] if new_msg_id else "-",
+                same_id,
+                len(content),
+            )
+            return SendResult(success=True, message_id=new_msg_id, raw_response=data)
+        except Exception as e:
+            return SendResult(success=False, error=str(e), retryable=True)
 
     # ------------------------------------------------------------------
     # Native media sending
