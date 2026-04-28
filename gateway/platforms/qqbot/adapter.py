@@ -1924,6 +1924,31 @@ class QQAdapter(BasePlatformAdapter):
             logger.info("[QQ_DIAG] overflow_detected chat_type=%s len=%d limit=%d stream_idx=%d",
                         chat_type, len(content), self.MAX_MESSAGE_LENGTH, stream["index"])
 
+        # Handle overflow: when content exceeds limit with an active stream,
+        # finalize the current stream and create a new one for overflow content.
+        if stream is not None and len(content) > self.MAX_MESSAGE_LENGTH:
+            logger.info("[QQ_DIAG] overflow_trigger chat_id=%s len=%d limit=%d",
+                        chat_id, len(content), self.MAX_MESSAGE_LENGTH)
+            # _handle_stream_overflow finalizes the existing stream (truncated)
+            # and creates a new stream with the full content (state=1).
+            result = await self._handle_stream_overflow(chat_id, content, 1)
+            # If this was a finalize call, send one more chunk on the new stream
+            # to finalize it (state=10).
+            if finalize:
+                new_stream = self._stream_states.get(chat_id)
+                if new_stream:
+                    finalize_result = await self._send_stream_chunk(
+                        chat_id, content, stream_state=10,
+                        msg_id=new_stream["msg_id"], index=new_stream["index"],
+                    )
+                    if finalize_result.success:
+                        try:
+                            del self._stream_states[chat_id]
+                        except KeyError:
+                            pass
+                    return finalize_result
+            return result
+
         state = 10 if finalize else 1
         idx = stream["index"]
         result = await self._send_stream_chunk(
