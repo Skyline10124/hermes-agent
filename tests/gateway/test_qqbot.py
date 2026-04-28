@@ -627,3 +627,123 @@ class TestStreamDiagnostics:
             chat_id="test_c2c", message_id="any", content="update", finalize=False,
         )
         assert "[QQ_DIAG] id_rot" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Stream overflow split integration tests
+# ---------------------------------------------------------------------------
+
+class TestStreamOverflow:
+    """Integration tests for the overflow split protocol in edit_message."""
+
+    def _make_adapter(self, **extra):
+        from gateway.platforms.qqbot import QQAdapter
+        return QQAdapter(_make_config(**extra))
+
+    @pytest.mark.asyncio
+    async def test_stream_overflow_splits_active_stream(self):
+        """Overflow content triggers finalize of old stream + creation of new stream."""
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        adapter._stream_enabled = True
+        adapter._stream_states["test_c2c"] = {"msg_id": "msg_1", "index": 3}
+        adapter._chat_type_map["test_c2c"] = "c2c"
+        adapter._api_request = mock.AsyncMock(return_value={"id": "msg_2"})
+
+        content = "A" * 4100  # > MAX_MESSAGE_LENGTH (4000)
+        result = await adapter.edit_message(
+            chat_id="test_c2c", message_id="old", content=content, finalize=False,
+        )
+
+        assert result.success is True
+        assert adapter._api_request.call_count == 2
+
+        calls = adapter._api_request.call_args_list
+        # First call: finalize old stream (state=10)
+        call1_body = calls[0].args[2]
+        assert call1_body["stream"]["state"] == 10
+        assert call1_body["stream"]["id"] == "msg_1"
+
+        # Second call: create new stream (state=1, no stream id)
+        call2_body = calls[1].args[2]
+        assert call2_body["stream"]["state"] == 1
+        assert "id" not in call2_body["stream"]
+
+        # New stream tracked in _stream_states
+        assert adapter._stream_states["test_c2c"]["msg_id"] == "msg_2"
+
+    @pytest.mark.asyncio
+    async def test_stream_overflow_with_finalize_closes_new_stream(self):
+        """Overflow + finalize makes 3 calls: finalize old, create new, finalize new."""
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        adapter._stream_enabled = True
+        adapter._stream_states["test_c2c"] = {"msg_id": "msg_1", "index": 3}
+        adapter._chat_type_map["test_c2c"] = "c2c"
+        adapter._api_request = mock.AsyncMock(return_value={"id": "msg_2"})
+
+        content = "A" * 4100
+        result = await adapter.edit_message(
+            chat_id="test_c2c", message_id="old", content=content, finalize=True,
+        )
+
+        assert result.success is True
+        assert adapter._api_request.call_count == 3
+
+        calls = adapter._api_request.call_args_list
+        # Call 1: finalize old stream (state=10, id=msg_1)
+        assert calls[0].args[2]["stream"]["state"] == 10
+        assert calls[0].args[2]["stream"]["id"] == "msg_1"
+
+        # Call 2: create new stream (state=1, no id)
+        assert calls[1].args[2]["stream"]["state"] == 1
+        assert "id" not in calls[1].args[2]["stream"]
+
+        # Call 3: finalize new stream (state=10, id=msg_2)
+        assert calls[2].args[2]["stream"]["state"] == 10
+        assert calls[2].args[2]["stream"]["id"] == "msg_2"
+
+        # Stream state cleaned up after finalize
+        assert "test_c2c" not in adapter._stream_states
+
+    @pytest.mark.asyncio
+    async def test_stream_overflow_disabled_skips_split(self, caplog):
+        """When _overflow_split_enabled=False, overflow content skips split logic."""
+        caplog.set_level(logging.INFO)
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        adapter._overflow_split_enabled = False
+        adapter._stream_enabled = True
+        adapter._stream_states["test_c2c"] = {"msg_id": "msg_1", "index": 3}
+        adapter._chat_type_map["test_c2c"] = "c2c"
+        adapter._api_request = mock.AsyncMock(return_value={"id": "msg_2"})
+
+        content = "A" * 4100
+        result = await adapter.edit_message(
+            chat_id="test_c2c", message_id="old", content=content, finalize=False,
+        )
+
+        # Only one call — normal send, no split
+        assert adapter._api_request.call_count == 1
+        call_body = adapter._api_request.call_args.args[2]
+        assert call_body["stream"]["state"] == 1
+
+        # Diagnostic fires independently of the split decision
+        assert "[QQ_DIAG] overflow_detected" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_stream_overflow_normal_path_unchanged(self):
+        """Content <= MAX_MESSAGE_LENGTH follows normal stream path (no overflow logic)."""
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        adapter._stream_enabled = True
+        adapter._stream_states["test_c2c"] = {"msg_id": "msg_1", "index": 3}
+        adapter._chat_type_map["test_c2c"] = "c2c"
+        adapter._api_request = mock.AsyncMock(return_value={"id": "msg_2"})
+
+        content = "A" * 500
+        result = await adapter.edit_message(
+            chat_id="test_c2c", message_id="old", content=content, finalize=False,
+        )
+
+        assert adapter._api_request.call_count == 1
+        call_body = adapter._api_request.call_args.args[2]
+        assert call_body["stream"]["state"] == 1
+        assert call_body["stream"]["id"] == "msg_1"
+        assert call_body["stream"]["index"] == 3
