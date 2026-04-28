@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import sys
 from unittest import mock
@@ -569,7 +570,7 @@ class TestWaitForReconnection:
         result = await adapter.send("test_openid", "Hello!")
         assert result.success
         assert result.message_id == "msg_immediate"
-
+ 
     @pytest.mark.asyncio
     async def test_send_media_waits_for_reconnect(self):
         """_send_media should also wait for reconnection."""
@@ -582,3 +583,47 @@ class TestWaitForReconnection:
         assert not result.success
         assert result.retryable is True
         assert "Not connected" in result.error
+
+
+# ---------------------------------------------------------------------------
+# Stream diagnostics
+# ---------------------------------------------------------------------------
+
+class TestStreamDiagnostics:
+    """Diagnostic logging for QQ stream protocol operations."""
+
+    def _make_adapter(self, **extra):
+        from gateway.platforms.qqbot import QQAdapter
+        return QQAdapter(_make_config(**extra))
+
+    def test_truncation_warning_logged(self, caplog):
+        """_build_text_body should log [QQ_DIAG] truncation when content exceeds MAX_MESSAGE_LENGTH."""
+        adapter = self._make_adapter(app_id="a", client_secret="b", markdown_support=True)
+        adapter._build_text_body(content="A" * 4100)
+        assert "[QQ_DIAG] truncation" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_non_c2c_skip_logs_diagnostic(self, caplog):
+        """edit_message should log [QQ_DIAG] non_c2c_skip for non-C2C chats."""
+        caplog.set_level(logging.INFO)
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        adapter._chat_type_map["test_group"] = "group"
+        result = await adapter.edit_message(
+            chat_id="test_group", message_id="msg", content="hello"
+        )
+        assert "[QQ_DIAG] non_c2c_skip" in caplog.text
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_id_rot_logged(self, caplog):
+        """edit_message should log [QQ_DIAG] id_rot when the message ID rotates."""
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        adapter._stream_states["test_c2c"] = {"msg_id": "msg_old_123", "index": 3}
+        adapter._chat_type_map["test_c2c"] = "c2c"
+        adapter._stream_enabled = True
+        adapter._api_request = mock.AsyncMock(return_value={"id": "msg_new_999"})
+        caplog.set_level(logging.INFO)
+        result = await adapter.edit_message(
+            chat_id="test_c2c", message_id="any", content="update", finalize=False,
+        )
+        assert "[QQ_DIAG] id_rot" in caplog.text

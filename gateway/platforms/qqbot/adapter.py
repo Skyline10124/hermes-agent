@@ -1948,6 +1948,24 @@ class QQAdapter(BasePlatformAdapter):
 
         return result
 
+    async def _handle_stream_overflow(self, chat_id, content, stream_state):
+        existing_stream = self._stream_states.get(chat_id)
+        if existing_stream is not None:
+            logger.info("[QQ_DIAG] overflow_split finalize chat_id=%s old_id=%s", chat_id, existing_stream.get("msg_id", "-"))
+            trunc = content[:self.MAX_MESSAGE_LENGTH] + "\n"
+            finalize_result = await self._send_stream_chunk(chat_id, trunc, stream_state=10, msg_id=existing_stream["msg_id"], index=existing_stream["index"])
+            if not finalize_result.success:
+                logger.error("[QQ_DIAG] overflow_split finalize_failed chat_id=%s error=%s", chat_id, finalize_result.error)
+            try:
+                del self._stream_states[chat_id]
+            except KeyError:
+                pass
+        logger.info("[QQ_DIAG] overflow_split create_new chat_id=%s len=%d", chat_id, len(content))
+        result = await self._send_stream_chunk(chat_id, content, stream_state=1, msg_id=None, index=0)
+        if result.success and result.message_id:
+            self._stream_states[chat_id] = {"msg_id": result.message_id, "index": 1}
+        return result
+
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         chat_type = self._guess_chat_type(chat_id)
         if chat_type != "c2c":
