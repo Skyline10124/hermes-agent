@@ -162,6 +162,7 @@ class QQAdapter(BasePlatformAdapter):
             if not fut.done():
                 fut.set_exception(RuntimeError(reason))
         self._pending_responses.clear()
+        self._stream_states.clear()
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.QQBOT)
@@ -173,6 +174,7 @@ class QQAdapter(BasePlatformAdapter):
         ).strip()
         self._markdown_support = bool(extra.get("markdown_support", True))
         self._stream_enabled = bool(extra.get("stream_enabled", True))
+        self._overflow_split_enabled = bool(extra.get("stream_overflow_split", True))
 
         # Auth/ACL policies
         self._dm_policy = str(extra.get("dm_policy", "open")).strip().lower()
@@ -1926,7 +1928,8 @@ class QQAdapter(BasePlatformAdapter):
 
         # Handle overflow: when content exceeds limit with an active stream,
         # finalize the current stream and create a new one for overflow content.
-        if stream is not None and len(content) > self.MAX_MESSAGE_LENGTH:
+        if (stream is not None and len(content) > self.MAX_MESSAGE_LENGTH
+                and self._overflow_split_enabled):
             logger.info("[QQ_DIAG] overflow_trigger chat_id=%s len=%d limit=%d",
                         chat_id, len(content), self.MAX_MESSAGE_LENGTH)
             # _handle_stream_overflow finalizes the existing stream (truncated)
@@ -1941,11 +1944,10 @@ class QQAdapter(BasePlatformAdapter):
                         chat_id, content, stream_state=10,
                         msg_id=new_stream["msg_id"], index=new_stream["index"],
                     )
-                    if finalize_result.success:
-                        try:
-                            del self._stream_states[chat_id]
-                        except KeyError:
-                            pass
+                    try:
+                        del self._stream_states[chat_id]
+                    except KeyError:
+                        pass
                     return finalize_result
             return result
 
