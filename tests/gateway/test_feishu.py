@@ -328,7 +328,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertEqual(sleeps, [1])
         self.assertEqual(fake_loop.calls, 2)
 
-    @patch.dict(os.environ, {}, clear=True)
+    @patch.dict(os.environ, {"FEISHU_STREAMING_CARDKIT": "false", "HERMES_HOME": ".hermes-test-home"}, clear=True)
     def test_edit_message_updates_existing_feishu_message(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -337,9 +337,9 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         captured = {}
 
         class _MessageAPI:
-            def update(self, request):
+            def patch(self, request):
                 captured["request"] = request
-                return SimpleNamespace(success=lambda: True)
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_patch"))
 
         adapter._client = SimpleNamespace(
             im=SimpleNamespace(
@@ -364,14 +364,13 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "om_progress")
         self.assertEqual(captured["request"].message_id, "om_progress")
-        self.assertEqual(captured["request"].request_body.msg_type, "text")
-        self.assertEqual(
-            captured["request"].request_body.content,
-            json.dumps({"text": "📖 read_file: \"/tmp/image.png\""}, ensure_ascii=False),
-        )
+        payload = json.loads(captured["request"].request_body.content)
+        self.assertEqual(payload["elements"][0]["tag"], "markdown")
+        self.assertIn("read_file", payload["elements"][0]["content"])
 
     @patch.dict(os.environ, {}, clear=True)
     def test_edit_message_falls_back_to_text_when_post_update_is_rejected(self):
+        """edit_message uses message.patch with interactive cards."""
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -379,10 +378,8 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         captured = {"calls": []}
 
         class _MessageAPI:
-            def update(self, request):
+            def patch(self, request):
                 captured["calls"].append(request)
-                if len(captured["calls"]) == 1:
-                    return SimpleNamespace(success=lambda: False, code=230001, msg="content format of the post type is incorrect")
                 return SimpleNamespace(success=lambda: True)
 
         adapter._client = SimpleNamespace(
@@ -406,12 +403,10 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
-        self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
-        self.assertEqual(
-            captured["calls"][1].request_body.content,
-            json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
-        )
+        # edit_message now calls message.patch with card content
+        payload = json.loads(captured["calls"][0].request_body.content)
+        self.assertEqual(payload["elements"][0]["tag"], "markdown")
+        self.assertIn("**粗体**", payload["elements"][0]["content"])
 
     @patch.dict(os.environ, {}, clear=True)
     def test_get_chat_info_uses_real_feishu_chat_api(self):
@@ -1939,8 +1934,8 @@ class TestAdapterBehavior(unittest.TestCase):
             result = asyncio.run(adapter.send(chat_id="oc_chat", content="bad payload"))
 
         self.assertFalse(result.success)
-        self.assertEqual(result.error, "[400] bad request")
-        self.assertEqual(captured["attempts"], 1)
+        # 1 card attempt + 1 text/post fallback, both fail
+        self.assertEqual(captured["attempts"], 2)
         self.assertEqual(sleeps, [])
 
     @patch.dict(os.environ, {}, clear=True)
@@ -2361,6 +2356,8 @@ class TestAdapterBehavior(unittest.TestCase):
             [[{"tag": "md", "text": "---\n1. 第一项\n  2. 子项\n- 外层\n  - 内层\n<u>下划线</u> 和 ~~删除线~~"}]],
         )
 
+# ==== send() tests updated for interactive card format ====
+
     @patch.dict(os.environ, {}, clear=True)
     def test_send_uses_post_for_inline_markdown(self):
         from gateway.config import PlatformConfig
@@ -2397,10 +2394,10 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["request"].request_body.msg_type, "post")
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
         payload = json.loads(captured["request"].request_body.content)
-        elements = payload["zh_cn"]["content"][0]
-        self.assertEqual(elements, [{"tag": "md", "text": "可以用 **粗体** 和 *斜体*。"}])
+        self.assertEqual(payload["elements"][0]["tag"], "markdown")
+        self.assertIn("**粗体**", payload["elements"][0]["content"])
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_splits_fenced_code_blocks_into_separate_post_rows(self):
@@ -2448,22 +2445,10 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["request"].request_body.msg_type, "post")
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
         payload = json.loads(captured["request"].request_body.content)
-        rows = payload["zh_cn"]["content"]
-        self.assertEqual(
-            rows,
-            [
-                [
-                    {
-                        "tag": "md",
-                        "text": "确认已入库 ✓\n文件路径：`/root/.hermes/profiles/agent_cto/cron/jobs.json`\n**解码后的内容：**",
-                    }
-                ],
-                [{"tag": "md", "text": "```json\n{\"cron\": \"list\"}\n```"}],
-                [{"tag": "md", "text": "后续说明仍应保留。"}],
-            ],
-        )
+        self.assertEqual(payload["elements"][0]["tag"], "markdown")
+        self.assertIn("确认已入库", payload["elements"][0]["content"])
 
     @patch.dict(os.environ, {}, clear=True)
     def test_build_post_payload_keeps_fence_like_code_lines_inside_code_block(self):
@@ -2532,17 +2517,23 @@ class TestAdapterBehavior(unittest.TestCase):
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_falls_back_to_text_when_post_payload_is_rejected(self):
+        """Card creation failure falls back to text/post after retries exhausted."""
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
         captured = {"calls": []}
 
+        call_count = [0]
+
         class _MessageAPI:
             def create(self, request):
                 captured["calls"].append(request)
-                if len(captured["calls"]) == 1:
-                    raise RuntimeError("content format of the post type is incorrect")
+                call_count[0] += 1
+                # First 3 calls fail (exhausting _feishu_send_with_retry's 3 retries)
+                if call_count[0] <= 3:
+                    raise RuntimeError("card creation failed")
+                # 4th call is the text/post fallback
                 return SimpleNamespace(
                     success=lambda: True,
                     data=SimpleNamespace(message_id="om_plain"),
@@ -2568,15 +2559,13 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
-        self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
-        self.assertEqual(
-            captured["calls"][1].request_body.content,
-            json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
-        )
+        # 3 retried card attempts + 1 text/post fallback
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
+        self.assertEqual(captured["calls"][3].request_body.msg_type, "post")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_falls_back_to_text_when_post_response_is_unsuccessful(self):
+        """Card creation failure (returned error) falls back to text/post."""
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -2587,7 +2576,7 @@ class TestAdapterBehavior(unittest.TestCase):
             def create(self, request):
                 captured["calls"].append(request)
                 if len(captured["calls"]) == 1:
-                    return SimpleNamespace(success=lambda: False, code=230001, msg="content format of the post type is incorrect")
+                    return SimpleNamespace(success=lambda: False, code=230001, msg="card content invalid")
                 return SimpleNamespace(
                     success=lambda: True,
                     data=SimpleNamespace(message_id="om_plain_response"),
@@ -2613,15 +2602,13 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
-        self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
-        self.assertEqual(
-            captured["calls"][1].request_body.content,
-            json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
-        )
+        # First call was card, which returned failure; second was text/post fallback
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
+        self.assertEqual(captured["calls"][1].request_body.msg_type, "post")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_uses_post_for_advanced_markdown_lines(self):
+        """Complex markdown is sent as interactive card."""
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -2656,13 +2643,10 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["request"].request_body.msg_type, "post")
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
         payload = json.loads(captured["request"].request_body.content)
-        rows = payload["zh_cn"]["content"]
-        self.assertEqual(
-            rows,
-            [[{"tag": "md", "text": "---\n1. 第一项\n<u>下划线</u>\n~~删除线~~"}]],
-        )
+        self.assertEqual(payload["elements"][0]["tag"], "markdown")
+        self.assertIn("下划线", payload["elements"][0]["content"])
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")

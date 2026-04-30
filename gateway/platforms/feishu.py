@@ -97,6 +97,8 @@ try:
         GetMessageRequest,
         GetMessageResourceRequest,
         P2ImMessageMessageReadV1,
+        PatchMessageRequest,
+        PatchMessageRequestBody,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
         UpdateMessageRequest,
@@ -1366,6 +1368,8 @@ class FeishuAdapter(BasePlatformAdapter):
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+        # Running card tracking: source_message_id → card_message_id
+        self._running_cards: Dict[str, str] = {}
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1638,46 +1642,50 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a Feishu message."""
+        """Send a Feishu interactive card message.
+
+        When a running card exists for the *reply_to* source, patches it in
+        place instead of creating a new message.
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        # If we have a running card for this source, patch it in place
+        if reply_to and reply_to in self._running_cards:
+            card_id = self._running_cards[reply_to]
+            return await self.edit_message(chat_id, card_id, content)
+
+        chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH)
         last_response = None
 
         try:
             for chunk in chunks:
-                msg_type, payload = self._build_outbound_payload(chunk)
+                payload = self._build_card_content(chunk)
                 try:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
-                        msg_type=msg_type,
+                        msg_type="interactive",
                         payload=payload,
                         reply_to=reply_to,
                         metadata=metadata,
                     )
-                except Exception as exc:
-                    if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
-                        raise
-                    logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
+                    # Fallback to text/post if interactive card was rejected
+                    if not self._response_succeeded(response):
+                        msg_type, fallback_payload = self._build_outbound_payload(chunk)
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type=msg_type,
+                            payload=fallback_payload,
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                except Exception:
+                    # Fallback to text/post on card exception
+                    msg_type, fallback_payload = self._build_outbound_payload(chunk)
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                if (
-                    msg_type == "post"
-                    and not self._response_succeeded(response)
-                    and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
-                ):
-                    logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                        msg_type=msg_type,
+                        payload=fallback_payload,
                         reply_to=reply_to,
                         metadata=metadata,
                     )
@@ -1688,6 +1696,35 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    @staticmethod
+    def _build_card_content(text: str) -> str:
+        """Build a Feishu interactive card with markdown content."""
+        card = {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "elements": [{"tag": "markdown", "content": text}],
+        }
+        return json.dumps(card, ensure_ascii=False)
+
+    async def _create_running_card(self, source_message_id: str, chat_id: str,
+                                    reply_to: Optional[str] = None) -> Optional[str]:
+        """Create a running card placeholder and return its message_id."""
+        payload = self._build_card_content("Working on it...")
+        response = await self._feishu_send_with_retry(
+            chat_id=chat_id,
+            msg_type="interactive",
+            payload=payload,
+            reply_to=reply_to,
+            metadata={"reply_in_thread": True} if reply_to else None,
+        )
+        if self._response_succeeded(response):
+            data = getattr(response, "data", None)
+            msg_id = getattr(data, "message_id", None) if data else None
+            if msg_id:
+                self._running_cards[source_message_id] = str(msg_id)
+                return str(msg_id)
+        logger.warning("[Feishu] Failed to create running card for source=%s", source_message_id)
+        return None
+
     async def edit_message(
         self,
         chat_id: str,
@@ -1696,31 +1733,27 @@ class FeishuAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
-        """Edit a previously sent Feishu text/post message."""
+        """Patch a previously sent Feishu interactive card message."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        content = self.format_message(content)
         try:
-            msg_type, payload = self._build_outbound_payload(content)
-            body = self._build_update_message_body(msg_type=msg_type, content=payload)
-            request = self._build_update_message_request(message_id=message_id, request_body=body)
-            response = await asyncio.to_thread(self._client.im.v1.message.update, request)
-            result = self._finalize_send_result(response, "update failed")
-            if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
-                logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
-                fallback_body = self._build_update_message_body(
-                    msg_type="text",
-                    content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
+            payload = self._build_card_content(content)
+            request = (
+                PatchMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(
+                    PatchMessageRequestBody.builder().content(payload).build()
                 )
-                fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
-                fallback_response = await asyncio.to_thread(self._client.im.v1.message.update, fallback_request)
-                result = self._finalize_send_result(fallback_response, "update failed")
+                .build()
+            )
+            response = await asyncio.to_thread(self._client.im.v1.message.patch, request)
+            result = self._finalize_send_result(response, "patch failed")
             if result.success:
                 result.message_id = message_id
             return result
         except Exception as exc:
-            logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
+            logger.error("[Feishu] Failed to patch message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
     async def send_exec_approval(
@@ -2510,7 +2543,15 @@ class FeishuAdapter(BasePlatformAdapter):
         Per-chat lock ensures messages in the same chat are processed one at a
         time (matches openclaw's createChatQueue serial queue behaviour).
         """
+        # Create a running card for text messages so the user sees immediate feedback
         chat_id = getattr(event.source, "chat_id", "") or "" if event.source else ""
+        if event.message_type == MessageType.TEXT and not event.is_command():
+            asyncio.ensure_future(self._create_running_card(
+                source_message_id=event.message_id,
+                chat_id=chat_id,
+                reply_to=event.message_id,
+            ))
+
         chat_lock = self._get_chat_lock(chat_id)
         async with chat_lock:
             await self.handle_message(event)
@@ -2723,7 +2764,11 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=chat_type),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
-            thread_id=getattr(message, "thread_id", None) or None,
+            thread_id=(
+                getattr(message, "root_id", None)
+                or getattr(message, "thread_id", None)
+                or None
+            ),
             user_id_alt=sender_profile["user_id_alt"],
         )
         normalized = MessageEvent(
